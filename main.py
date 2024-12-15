@@ -8,21 +8,19 @@ from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import confusion_matrix, classification_report
 
 # ======================================================================
-# Integrating the logic from both models
+# File Paths (Replace with Actual Paths)
 # ======================================================================
+flight_data_path = r"C:\Users\arshp\OneDrive\Desktop\JFK-LAX flights 2023 Model.csv"
+geomagnetic_storm_duration_data_path = r"C:\Users\arshp\OneDrive\Desktop\Geomagnetic Storms - duration.xlsx"
+geomagnetic_storm_data_points_path = r"C:\Users\arshp\OneDrive\Desktop\geomagnetic_storm_data_points.csv"
 
-# File paths (replace with your actual paths)
-flight_data_path = 'flight_data_file_path'
-geomagnetic_storm_data_path_excel = r'C:\Users\wangc\Downloads\Geomagnetic Storms - duration.xlsx'  # New model source
-geomagnetic_storm_data_path_csv = 'geomagnetic_storm_data_file_path'  # Current model source
-
-# ----------------------------------------------------------------------
-# Load flight data and rename columns as in the current (original) model
-# ----------------------------------------------------------------------
+# ======================================================================
+# Load Flight Data
+# ======================================================================
 flight_data = pd.read_csv(flight_data_path)
 flight_data.rename(columns={'Date': 'date', 'Time': 'time', 'Total Delay': 'delay'}, inplace=True)
 
-# Drop unnecessary columns as in the current model
+# Drop unnecessary columns
 columns_to_drop = [
     'Terminal', 'Call Sign', 'Marketing Airline', 'General Aircraft Desc',
     'Max Takeoff Wt (Lbs)', 'Max Landing Wt (Lbs)', 'Intl / Dom',
@@ -32,110 +30,121 @@ for col in columns_to_drop:
     if col in flight_data.columns:
         flight_data.drop(columns=[col], inplace=True)
 
-# Ensure date is a proper datetime
+# Ensure date is datetime
 flight_data['date'] = pd.to_datetime(flight_data['date'], errors='coerce')
 flight_data.dropna(subset=['date'], inplace=True)
 
-# ----------------------------------------------------------------------
-# Load and process geomagnetic storm data using the new model approach
-# ----------------------------------------------------------------------
-geomagnetic_storm_data = pd.read_excel(geomagnetic_storm_data_path_excel)
-geomagnetic_storm_data.columns = geomagnetic_storm_data.columns.str.strip()
+# ======================================================================
+# Load and Process Storm Duration Data
+# ======================================================================
+storm_duration_data = pd.read_excel(geomagnetic_storm_duration_data_path)
+# Make sure storm_duration_data has a 'date' column or create one if it has separate year/month/day columns.
+# For demonstration, assume there's a 'date' column already or a way to form it.
+# If the file has 'YYYY', 'MM', 'DD', we can do:
+if all(c in storm_duration_data.columns for c in ['YYYY', 'MM', 'DD']):
+    storm_duration_data['date'] = pd.to_datetime(
+        storm_duration_data['YYYY'].astype(str) + '-' + 
+        storm_duration_data['MM'].astype(str).str.zfill(2) + '-' + 
+        storm_duration_data['DD'].astype(str).str.zfill(2),
+        format='%Y-%m-%d'
+    )
+elif 'date' in storm_duration_data.columns:
+    storm_duration_data['date'] = pd.to_datetime(storm_duration_data['date'], errors='coerce')
+else:
+    raise ValueError("No suitable date information found in storm_duration_data.")
 
-# Create a date column by combining year and month (new model logic)
-geomagnetic_storm_data['date'] = pd.to_datetime(
-    geomagnetic_storm_data['YYYY'].astype(str) + geomagnetic_storm_data['MM'].astype(str).str.zfill(2),
-    format='%Y%m'
-)
+storm_duration_data.dropna(subset=['date'], inplace=True)
 
-# Compute average disturbed and quiet days (from the new model)
-geomagnetic_storm_data['average_disturbed'] = geomagnetic_storm_data[['d1', 'd2', 'd3', 'd4', 'd5']].mean(axis=1)
-geomagnetic_storm_data['average_quiet'] = geomagnetic_storm_data[['q1', 'q2', 'q3', 'q4', 'q5', 'q6', 'q7', 'q8', 'q9', 'q0']].mean(axis=1)
+# The storm_duration_data should contain features like storm durations or related metrics.
+# Ensure these are numeric and cleaned if needed. For example:
+numeric_cols = storm_duration_data.select_dtypes(include=[np.number]).columns.tolist()
 
-# Filter necessary columns and remove rows without proper dates
-geomagnetic_storm_data = geomagnetic_storm_data.dropna(subset=['date'])
+# ======================================================================
+# Load and Process Geomagnetic Storm Data Points
+# ======================================================================
+geomagnetic_storm_points = pd.read_csv(geomagnetic_storm_data_points_path)
+# Ensure a proper date column
+if 'Date' in geomagnetic_storm_points.columns:
+    geomagnetic_storm_points['date'] = pd.to_datetime(geomagnetic_storm_points['Date'], errors='coerce')
+    geomagnetic_storm_points.drop(columns=['Date'], inplace=True)
+else:
+    # If already has 'date', just ensure datetime
+    geomagnetic_storm_points['date'] = pd.to_datetime(geomagnetic_storm_points['date'], errors='coerce')
+geomagnetic_storm_points.dropna(subset=['date'], inplace=True)
 
-# ----------------------------------------------------------------------
-# Merge the geomagnetic data with flight data (keeping useful features)
-# ----------------------------------------------------------------------
-data = pd.merge(flight_data, geomagnetic_storm_data[['date', 'average_disturbed', 'average_quiet']], on='date', how='inner')
+# Clean geomagnetic features (remove units, etc.)
+for c in geomagnetic_storm_points.columns:
+    if c not in ['date']:
+        # Remove common units if present
+        geomagnetic_storm_points[c] = geomagnetic_storm_points[c].astype(str).str.replace(' nT', '', regex=False)
+        geomagnetic_storm_points[c] = geomagnetic_storm_points[c].str.replace(' Kp', '', regex=False)
+        geomagnetic_storm_points[c] = geomagnetic_storm_points[c].str.replace('km/sec', '', regex=False)
+        geomagnetic_storm_points[c] = pd.to_numeric(geomagnetic_storm_points[c], errors='coerce')
 
-# ----------------------------------------------------------------------
-# Additional Geomagnetic Data (from current model CSV, if needed)
-# NOTE: If the CSV data overlaps or provides extra columns like Dst, Ap, Kp max, Speed, IMF Bt, IMF Bz,
-# we integrate them here. Otherwise, assume the new excel data already contained those columns.
-# ----------------------------------------------------------------------
-# Load the CSV-based geomagnetic data if it has unique indices/features
-geomagnetic_storm_data_csv = pd.read_csv(geomagnetic_storm_data_path_csv)
-geomagnetic_storm_data_csv.columns = geomagnetic_storm_data_csv.columns.str.strip()
-geomagnetic_storm_data_csv['date'] = pd.to_datetime(geomagnetic_storm_data_csv['Date'], errors='coerce')
-geomagnetic_storm_data_csv = geomagnetic_storm_data_csv.dropna(subset=['date'])
+geomagnetic_storm_points.dropna(subset=geomagnetic_storm_points.columns.difference(['date']), inplace=True)
 
-# Merge CSV-based geomagnetic data to supplement columns like Dst, Ap, Kp max, Speed, IMF Bt, IMF Bz
-data = pd.merge(data, geomagnetic_storm_data_csv, on='date', how='inner')
+# ======================================================================
+# Merge Storm Duration and Storm Points Data
+# ======================================================================
+# Merge on 'date' to combine storm duration metrics with actual storm data points
+geomagnetic_data_merged = pd.merge(storm_duration_data, geomagnetic_storm_points, on='date', how='inner')
 
-# ----------------------------------------------------------------------
-# Data Cleaning and Feature Engineering (current model logic)
-# ----------------------------------------------------------------------
-data = data.dropna()
+# If you have columns like 'average_disturbed' and 'average_quiet', you can compute them if needed:
+# For example, if storm_duration_data had disturbed/quiet day columns:
+disturbed_cols = [col for col in storm_duration_data.columns if 'd' in col]
+quiet_cols = [col for col in storm_duration_data.columns if 'q' in col]
+if disturbed_cols:
+    geomagnetic_data_merged['average_disturbed'] = geomagnetic_data_merged[disturbed_cols].mean(axis=1)
+if quiet_cols:
+    geomagnetic_data_merged['average_quiet'] = geomagnetic_data_merged[quiet_cols].mean(axis=1)
 
-# Convert delay to numeric and then to binary (delayed/not delayed)
-data['delay'] = pd.to_numeric(data['delay'], errors='coerce')
-data['delay'] = data['delay'].apply(lambda x: 1 if x > 0 else 0)
+# Drop rows without proper merged data
+geomagnetic_data_merged.dropna(subset=['date'], inplace=True)
 
-# Convert time to minutes since midnight
+# ======================================================================
+# Merge Flight Data with Combined Geomagnetic Data
+# ======================================================================
+data = pd.merge(flight_data, geomagnetic_data_merged, on='date', how='inner')
+data.dropna(inplace=True)
+
+# Convert delay to binary
+data['delay'] = pd.to_numeric(data['delay'], errors='coerce').apply(lambda x: 1 if x > 0 else 0)
+
+# Convert time to minutes since midnight if it's a time column
 data['time'] = pd.to_datetime(data['time'], errors='coerce').dt.hour * 60 + pd.to_datetime(data['time'], errors='coerce').dt.minute
 
-# Ensure all relevant columns are numeric; remove units if present
-geomagnetic_columns = ['Dst', 'Kp max', 'Speed', 'IMF Bt', 'IMF Bz', 'Ap']
-for column in geomagnetic_columns:
-    if column in data.columns:
-        # Remove known units (e.g. ' nT', ' Kp', 'km/sec') from current model
-        data[column] = data[column].astype(str).str.replace(' nT', '', regex=False)
-        data[column] = data[column].str.replace(' Kp', '', regex=False)
-        data[column] = data[column].str.replace('km/sec', '', regex=False)
-        data[column] = pd.to_numeric(data[column], errors='coerce')
+# Identify potential feature columns (geomagnetic indices + storm duration features + time)
+# Exclude non-numeric columns
+feature_candidates = data.select_dtypes(include=[np.number]).columns.tolist()
+feature_candidates = [c for c in feature_candidates if c not in ['delay']]  # exclude target
 
-# Drop rows missing essential features
-all_required_features = ['time', 'Dst', 'Ap', 'Speed', 'IMF Bt', 'IMF Bz', 'average_disturbed', 'average_quiet']
-data = data.dropna(subset=all_required_features + ['delay'])
-
-# ----------------------------------------------------------------------
-# Feature Selection (Integrate New Model Features + Current Model)
-# We now have average_disturbed and average_quiet from the new model
-# along with the geomagnetic indices and time from the current model
-# ----------------------------------------------------------------------
-features = ['time', 'Dst', 'Ap', 'Speed', 'IMF Bt', 'IMF Bz', 'average_disturbed', 'average_quiet']
-X = data[features]
+X = data[feature_candidates]
 y = data['delay']
 
-# ----------------------------------------------------------------------
-# Train/Test Split, Scaling, and Modeling
-# (Retain advanced interpretation from current model)
-# ----------------------------------------------------------------------
+# ======================================================================
+# Correlation Analysis
+# ======================================================================
+corr_matrix = data[feature_candidates + ['delay']].corr(numeric_only=True)
+plt.figure(figsize=(12, 8))
+sns.heatmap(corr_matrix, annot=True, cmap='coolwarm')
+plt.title('Correlation Matrix of Merged Data')
+plt.show()
+
+# If correlation is low, consider feature selection, or try different aggregations/time windows.
+# For modeling:
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
 
-# Updated correlation matrix with new features
-corr_matrix = data[features + ['delay']].corr(numeric_only=True)
-plt.figure(figsize=(12, 8))
-sns.heatmap(corr_matrix, annot=True, cmap='coolwarm')
-plt.title('Updated Correlation Matrix with Geomagnetic Data')
-plt.show()
-
-# Train Logistic Regression
 logreg = LogisticRegression(max_iter=1000)
 logreg.fit(X_train_scaled, y_train)
 
-# Cross-validation
 cv_scores = cross_val_score(logreg, X_train_scaled, y_train, cv=5)
 cv_mean = np.mean(cv_scores)
 cv_std = np.std(cv_scores)
 
-# Predictions and confusion matrix
 y_pred = logreg.predict(X_test_scaled)
 conf_matrix = confusion_matrix(y_test, y_pred)
 
@@ -146,13 +155,9 @@ plt.xlabel('Predicted')
 plt.ylabel('Actual')
 plt.show()
 
-# Classification report
-class_report = classification_report(y_test, y_pred, output_dict=True)
 class_report_text = classification_report(y_test, y_pred)
+print(class_report_text)
 
-# ----------------------------------------------------------------------
-# Retain the CorrelationOutcome Class and Conclusions from Current Model
-# ----------------------------------------------------------------------
 class CorrelationOutcome:
     def __init__(self, logistic_model, threshold=0.5):
         self.model = logistic_model
@@ -165,71 +170,34 @@ class CorrelationOutcome:
         return accuracy, y_pred
 
     def conclusive_sentence(self, accuracy):
-        # Using Dst index as a proxy for geomagnetic storm intensity correlation as per original logic
         if accuracy > 0.7:
-            return "True: There is a significant correlation between geomagnetic storm intensity (Dst index) and flight delays."
+            return "True: There is a significant correlation between the chosen geomagnetic metrics and flight delays."
         else:
-            return "False: There is no significant correlation between geomagnetic storm intensity (Dst index) and flight delays."
+            return "False: There is no significant correlation between the chosen geomagnetic metrics and flight delays."
 
-# Evaluate correlation outcome
 correlation_outcome = CorrelationOutcome(logreg)
 accuracy, y_pred_thresh = correlation_outcome.evaluate(X_test_scaled, y_test)
 conclusion = correlation_outcome.conclusive_sentence(accuracy)
 print(conclusion)
 
-# Visualization of model performance metrics
+# Display model performance
+report_dict = classification_report(y_test, y_pred, output_dict=True)
 plt.figure(figsize=(10, 6))
-sns.barplot(x=['Accuracy', 'Precision', 'Recall', 'F1-Score'], y=[
-    accuracy,
-    class_report['1']['precision'],
-    class_report['1']['recall'],
-    class_report['1']['f1-score']
-])
+sns.barplot(x=['Accuracy', 'Precision', 'Recall', 'F1-Score'], 
+            y=[accuracy,
+               report_dict['1']['precision'],
+               report_dict['1']['recall'],
+               report_dict['1']['f1-score']])
 plt.title('Model Performance Metrics')
 plt.ylabel('Score')
 plt.ylim(0, 1)
 plt.show()
 
-# Summary of findings
-classification_report_text = eval(classification_report)
 summary_of_findings = f"""
 Summary of Findings:
 Cross-validation accuracy: {cv_mean:.2f} ± {cv_std:.2f}
 Confusion Matrix:
 {conf_matrix}
-{classification_report_text}
+{class_report_text}
 """
 print(summary_of_findings)
-
-# ----------------------------------------------------------------------
-# Decision Boundary Plot (Retain from Current Model, but can select two geomagnetic features)
-# ----------------------------------------------------------------------
-def plot_decision_boundary(X, y, model, features):
-    x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
-    y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
-    xx, yy = np.meshgrid(np.arange(x_min, x_max, 0.01),
-                         np.arange(y_min, y_max, 0.01))
-    Z = model.predict(np.c_[xx.ravel(), yy.ravel()])
-    Z = Z.reshape(xx.shape)
-    plt.contourf(xx, yy, Z, alpha=0.4, cmap=plt.cm.Spectral)
-    plt.scatter(X[:, 0], X[:, 1], c=y, s=20, edgecolor='k')
-    plt.xlabel(features[0])
-    plt.ylabel(features[1])
-    plt.title('Logistic Regression Decision Boundary')
-
-# Select two features for decision boundary plot (e.g., 'average_disturbed' and 'average_quiet')
-selected_features = ['average_disturbed', 'average_quiet']
-X_selected = data[selected_features].values
-y_selected = data['delay'].values
-
-X_train_sel, X_test_sel, y_train_sel, y_test_sel = train_test_split(X_selected, y_selected, test_size=0.2, random_state=42)
-
-X_train_sel_scaled = scaler.fit_transform(X_train_sel)
-X_test_sel_scaled = scaler.transform(X_test_sel)
-
-logreg_sel = LogisticRegression(max_iter=1000)
-logreg_sel.fit(X_train_sel_scaled, y_train_sel)
-
-plt.figure(figsize=(10, 6))
-plot_decision_boundary(X_test_sel_scaled, y_test_sel, logreg_sel, selected_features)
-plt.show()
