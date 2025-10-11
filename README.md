@@ -1,1 +1,0 @@
-# GeomagneticStorm_AirplaneDelay Model
