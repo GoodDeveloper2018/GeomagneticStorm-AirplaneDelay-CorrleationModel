@@ -150,9 +150,9 @@ flight['delay_minutes'] = pd.to_numeric(flight['delay_minutes'], errors='coerce'
 
 # Drop irrelevant columns if present
 drop_cols = [
-    'Terminal', 'Call_Sign', 'Marketing_Airline', 'General_Aircraft_Desc',
-    'Max_Takeoff_Wt_Lbs', 'Max_Landing_Wt_Lbs', 'Intl/_Dom', 'Total_Seats',
-    'Total_Taxi_Time', 'Direction', 'PA_Airport', 'Non-PA_Airport'
+    'Terminal', 'Marketing_Airline',
+    'Max_Takeoff_Wt_Lbs','Max_Landing_Wt_Lbs','Intl/_Dom','Total_Seats',
+    'Total_Taxi_Time','Direction','PA_Airport','Non-PA_Airport'
 ]
 flight = flight.drop(columns=[c for c in drop_cols if c in flight.columns], errors='ignore')
 
@@ -283,6 +283,194 @@ for c in ['Dst', 'Ap', 'Kp_max', 'IMF_Bt', 'IMF_Bz', 'Speed',
         df[c] = pd.to_numeric(df[c], errors='coerce')
         if df[c].isna().any():
             df[c] = df[c].fillna(df[c].median())
+# -------------------------------------------------
+# (A) Preserve identifiers for by-flight analyses
+# -------------------------------------------------
+keep_id_cols = []
+for c in ['Flight_Number','Call_Sign','General_Aircraft_Desc']:
+    if c in df.columns:
+        keep_id_cols.append(c)
+
+# -------------------------------------------------
+# (B) Physics-informed scintillation proxies
+# -------------------------------------------------
+# Ey already computed in your code; ensure numeric
+for c in ['IMF_Bz','Kp_max','Dst','Ey','storm_coupling']:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+
+# Basic scintillation flag: top-decile Ey with southward Bz
+ey_q90 = df['Ey'].quantile(0.90)
+df['scint_flag'] = ((df['Ey'] >= ey_q90) & (df['IMF_Bz'] < 0)).astype(int)
+
+# Composite Scintillation Risk Index (SRI)
+from scipy.stats import zscore
+def nz(x):
+    x = pd.to_numeric(x, errors='coerce')
+    return pd.Series(zscore(x.replace([np.inf,-np.inf], np.nan).fillna(x.median())), index=x.index)
+
+df['SRI'] = (
+    nz(df['Ey']) +
+    nz(df['IMF_Bz'].clip(upper=0).abs()) +   # z(max(0,-Bz))
+    0.5 * nz(df['Kp_max']) +
+    0.5 * nz(df['Dst'].abs())                # |Dst| as storm intensity magnitude
+)
+df['SRI_night'] = df['SRI'] * df['night']
+
+# -------------------------------------------------
+# (C) TIME-SERIES OVERLAYS (physics + operations)
+# -------------------------------------------------
+df['delay_minutes'] = pd.to_numeric(df['delay_minutes'], errors='coerce')
+df['delay_binary']  = (df['delay_minutes'] > 0).astype(int)
+df['big_delay_30']  = (df['delay_minutes'] >= 30).astype(int)
+
+daily = df.groupby('date', as_index=False).agg({
+    'delay_binary':'mean',
+    'big_delay_30':'mean',
+    'IMF_Bz':'first','Kp_max':'first','Dst':'first',
+    'Ey':'first','storm_coupling':'first','SRI':'first','SRI_night':'first'
+})
+
+plt.figure(figsize=(11,9))
+axes = [plt.subplot(5,1,i+1) for i in range(5)]
+series = ['Kp_max','IMF_Bz','Dst','Ey','SRI_night']
+labels  = ['Kp index','IMF Bz (nT)','Dst (nT)','Ey (V/km, proxy)','SRI (night-weighted)']
+thresh  = {'Kp_max':6, 'IMF_Bz':-10, 'Dst':-70}
+
+for ax, s, lab in zip(axes, series, labels):
+    ax.plot(daily['date'], daily[s], label=lab, lw=1.6, color='C0')
+    if s in thresh:
+        ax.axhline(thresh[s], ls='--', color='C0', alpha=0.7)
+    ax.set_ylabel(lab)
+    ax2 = ax.twinx()
+    ax2.plot(daily['date'], daily['delay_binary'], color='crimson', alpha=0.65, label='Delay rate')
+    ax2.set_ylim(0,1)
+    if s == series[0]:
+        ax2.legend(loc='upper right', fontsize=8)
+axes[-1].set_xlabel('Date')
+plt.suptitle('Space-Weather Drivers vs. Daily Flight Delay Rate (thresholds annotated)', y=0.94)
+plt.tight_layout(rect=[0,0,1,0.95])
+plt.savefig('fig_timeseries_physics_delay.png', dpi=200)
+plt.show()
+
+# -------------------------------------------------
+# (D) 2D DELAY PROBABILITY SURFACE: IMF_Bz × Kp_max
+# -------------------------------------------------
+bz_bins = np.linspace(df['IMF_Bz'].min(), df['IMF_Bz'].max(), 16)
+kp_bins = np.linspace(df['Kp_max'].min(), df['Kp_max'].max(), 12)
+
+grid = np.full((len(kp_bins)-1, len(bz_bins)-1), np.nan)
+nobs = np.zeros_like(grid)
+
+for i in range(len(kp_bins)-1):
+    for j in range(len(bz_bins)-1):
+        m = (df['Kp_max'].between(kp_bins[i], kp_bins[i+1], inclusive='left') &
+             df['IMF_Bz'].between(bz_bins[j], bz_bins[j+1], inclusive='left'))
+        if m.any():
+            grid[i,j] = df.loc[m, 'delay_binary'].mean()
+            nobs[i,j] = m.sum()
+
+plt.figure(figsize=(9,6))
+sns.heatmap(grid, cmap='YlOrRd', vmin=0, vmax=1,
+            xticklabels=np.round(bz_bins[1:],1), yticklabels=np.round(kp_bins[1:],1),
+            cbar_kws={'label':'Delay probability'})
+plt.xlabel('IMF Bz (nT)')
+plt.ylabel('Kp index')
+plt.title('Delay Probability vs. IMF Bz and Kp (bins)')
+# Mark storm quadrant lines
+# (row index where Kp>=6 starts; col index where Bz<=-10 ends)
+kp_idx = np.searchsorted(kp_bins, 6.0) - 1
+bz_idx = np.searchsorted(bz_bins, -10.0)
+plt.hlines(kp_idx, *plt.xlim(), colors='c', linestyles='--', label='Kp ≥ 6')
+plt.vlines(bz_idx, *plt.ylim(), colors='c', linestyles='--', label='Bz ≤ -10 nT')
+plt.legend(loc='upper left', fontsize=8)
+plt.tight_layout()
+plt.savefig('fig_heatmap_bz_kp_delay.png', dpi=200)
+plt.show()
+
+# -------------------------------------------------
+# (E) SCINTILLATION PROXY TESTS (bars + logistic)
+# -------------------------------------------------
+# Bar chart: delay probability with/without scint_flag
+plt.figure(figsize=(4.8,3.8))
+sns.barplot(x='scint_flag', y='delay_binary', data=df, ci=68, palette='Blues')
+plt.xticks([0,1], ['Scint flag = 0','Scint flag = 1'])
+plt.ylabel('Fraction delayed')
+plt.title('Delay probability under scintillation proxy')
+plt.tight_layout()
+plt.savefig('fig_scint_flag_bar.png', dpi=200)
+plt.show()
+
+import statsmodels.formula.api as smf
+df['weekday'] = pd.to_datetime(df['date']).dt.weekday
+df['weekend'] = (df['weekday']>=5).astype(int)
+
+def fit_logit(formula, data, name):
+    model = smf.logit(formula, data=data).fit(disp=False)
+    summ = model.summary2().tables[1]
+    # odds ratios & 95% CI
+    summ['OR'] = np.exp(summ['Coef.'])
+    summ['OR_low'] = np.exp(summ['Coef.'] - 1.96*summ['Std.Err.'])
+    summ['OR_high'] = np.exp(summ['Coef.'] + 1.96*summ['Std.Err.'])
+    print(f"\n{name}\n", summ[['OR','OR_low','OR_high','P>|z|']].round(3))
+    return model, summ
+
+logit_any, _ = fit_logit(
+    'delay_binary ~ scint_flag + night + weekend + average_disturbed + average_quiet',
+    df, 'Logit: any delay'
+)
+logit_big, _ = fit_logit(
+    'big_delay_30 ~ scint_flag + night + weekend + average_disturbed + average_quiet',
+    df, 'Logit: ≥30 min delay'
+)
+
+# -------------------------------------------------
+# (F) BY-FLIGHT COMPARISON (ops × physics linkage)
+# -------------------------------------------------
+# Per-flight-number exposure and outcomes
+group_keys = ['Flight_Number'] if 'Flight_Number' in df.columns else ['Call_Sign'] if 'Call_Sign' in df.columns else None
+if group_keys:
+    g = df.groupby(group_keys, as_index=False).agg({
+        'delay_binary':'mean',
+        'big_delay_30':'mean',
+        'night':'mean',
+        'SRI':'mean',
+        'SRI_night':'mean',
+        'Kp_max':'mean',
+        'IMF_Bz':'mean',
+        'Dst':'mean',
+        'Ey':'mean'
+    })
+    # Optional: airframe proxy for comm/nav profile
+    if 'General_Aircraft_Desc' in df.columns:
+        airframe = df[group_keys + ['General_Aircraft_Desc']].drop_duplicates()
+        g = g.merge(airframe, on=group_keys, how='left')
+        g['airframe_class'] = np.where(
+            g['General_Aircraft_Desc'].str.contains('777|787|767|A330|A350|A321LR', case=False, na=False),
+            'widebody/SATCOM-likely','narrowbody/VHF-dominant'
+        )
+
+    # Scatter: SRI_night exposure vs delay rate, colored by airframe class if present
+    plt.figure(figsize=(6,4.2))
+    if 'airframe_class' in g.columns:
+        sns.scatterplot(data=g, x='SRI_night', y='delay_binary', hue='airframe_class')
+        plt.legend(title='Airframe proxy', fontsize=8)
+    else:
+        sns.scatterplot(data=g, x='SRI_night', y='delay_binary')
+    plt.xlabel('Avg SRI at night (per flight number)')
+    plt.ylabel('Delay rate (fraction)')
+    plt.title('Flights with greater night-time scintillation exposure show higher delay rates')
+    plt.tight_layout()
+    plt.savefig('fig_byflight_sri_vs_delay.png', dpi=200)
+    plt.show()
+
+# -------------------------------------------------
+# (G) MODEL–EDA BRIDGE (quick check)
+# -------------------------------------------------
+# Do physics-heavy features matter to the trained models?
+physics_cols = [c for c in ['Kp_max','IMF_Bz','Dst','Ey','storm_coupling','SRI','SRI_night','night_bz_neg'] if c in df.columns]
+print("\nPhysics features present for modeling:", physics_cols)
+
 
 # -------------------------------------------------
 # 4) Label engineering: richer delay targets
