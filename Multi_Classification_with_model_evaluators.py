@@ -13,11 +13,15 @@ import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.base import clone  # (optional, if you want to play with manual stacking later)
 from sklearn.model_selection import (
     train_test_split,
     GroupKFold,
-    GridSearchCV
+    GridSearchCV,
+    cross_val_score
 )
+
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
@@ -393,7 +397,13 @@ plt.show()
 # -------------------------------------------------
 # Bar chart: delay probability with/without scint_flag
 plt.figure(figsize=(4.8,3.8))
-sns.barplot(x='scint_flag', y='delay_binary', data=df, ci=68, palette='Blues')
+sns.barplot(
+    x='scint_flag',
+    y='delay_binary',
+    data=df,
+    errorbar=('ci', 68),
+    color='steelblue'   # single color; avoids deprecated palette+no-hue usage
+)
 plt.xticks([0,1], ['Scint flag = 0','Scint flag = 1'])
 plt.ylabel('Fraction delayed')
 plt.title('Delay probability under scintillation proxy')
@@ -405,15 +415,30 @@ import statsmodels.formula.api as smf
 df['weekday'] = pd.to_datetime(df['date']).dt.weekday
 df['weekend'] = (df['weekday']>=5).astype(int)
 
+import numpy.linalg as npl
+
 def fit_logit(formula, data, name):
-    model = smf.logit(formula, data=data).fit(disp=False)
-    summ = model.summary2().tables[1]
-    # odds ratios & 95% CI
-    summ['OR'] = np.exp(summ['Coef.'])
-    summ['OR_low'] = np.exp(summ['Coef.'] - 1.96*summ['Std.Err.'])
-    summ['OR_high'] = np.exp(summ['Coef.'] + 1.96*summ['Std.Err.'])
-    print(f"\n{name}\n", summ[['OR','OR_low','OR_high','P>|z|']].round(3))
-    return model, summ
+    """
+    Fit a simple statsmodels logit for effect-size tables.
+    If the Hessian is singular (perfect separation / collinearity),
+    print a warning and skip instead of crashing the entire pipeline.
+    """
+    try:
+        model = smf.logit(formula, data=data).fit(disp=False)
+        summ = model.summary2().tables[1]
+
+        # odds ratios & 95% CI
+        summ['OR'] = np.exp(summ['Coef.'])
+        summ['OR_low'] = np.exp(summ['Coef.'] - 1.96 * summ['Std.Err.'])
+        summ['OR_high'] = np.exp(summ['Coef.'] + 1.96 * summ['Std.Err.'])
+
+        print(f"\n{name}\n", summ[['OR', 'OR_low', 'OR_high', 'P>|z|']].round(3))
+        return model, summ
+
+    except npl.LinAlgError:
+        print(f"\n[{name}] statsmodels logit failed (singular matrix). "
+              "Skipping OR table to keep the pipeline running.")
+        return None, None
 
 logit_any, _ = fit_logit(
     'delay_binary ~ scint_flag + night + weekend + average_disturbed + average_quiet',
@@ -610,7 +635,13 @@ gs_lr.fit(X_train, y_train, groups=groups_train)
 best_lr = gs_lr.best_estimator_
 print("\nBest Logistic (poly) params:", gs_lr.best_params_)
 print("Best Logistic (poly) CV AUC:", gs_lr.best_score_)
-_ = evaluate_model("LogReg + degree-2 interactions", best_lr, X_test, y_test)
+roc_lr, ap_lr = evaluate_model(
+    "LogReg + degree-2 interactions",
+    best_lr,
+    X_test,
+    y_test
+)
+
 
 
 # -------------------------------------------------
@@ -643,7 +674,13 @@ rf_cv.fit(X_train, y_train, groups=groups_train)
 best_rf = rf_cv.best_estimator_
 print("\nBest RF params:", rf_cv.best_params_)
 print("Best RF CV AUC:", rf_cv.best_score_)
-_ = evaluate_model("RandomForest (tuned)", best_rf, X_test, y_test)
+roc_rf, ap_rf = evaluate_model(
+    "RandomForest (tuned)",
+    best_rf,
+    X_test,
+    y_test
+)
+
 
 perm_rf = permutation_importance(
     best_rf,
@@ -703,7 +740,12 @@ try:
 
     print("\nBest XGB params:", xgb_cv.best_params_)
     print("Best XGB CV AUC:", xgb_cv.best_score_)
-    _ = evaluate_model("XGBoost (tuned)", best_xgb, X_test, y_test)
+    roc_xgb, ap_xgb = evaluate_model(
+        "XGBoost (tuned)",
+        best_xgb,
+        X_test,
+        y_test
+    )
 
     perm_xgb = permutation_importance(
         best_xgb,
@@ -728,3 +770,164 @@ try:
 except Exception as e:
     print("\n[XGBoost not available or failed — skipping XGB tuning]")
     print(e)
+
+# -------------------------------------------------
+# 10) Stacked ensemble: LogReg + RF (+ XGB if available)
+#     (group-aware, less overfitting)
+# -------------------------------------------------
+print("\n==============================")
+print("Training stacked ensemble model")
+print("==============================")
+
+# 10.1 Build list of base estimators using the tuned models
+base_estimators = [
+    ("lr", best_lr),
+    ("rf", best_rf),
+]
+
+if "best_xgb" in locals():
+    base_estimators.append(("xgb", best_xgb))
+    print("Stacking base models: Logistic (poly) + RF + XGB")
+else:
+    print("Stacking base models: Logistic (poly) + RF (XGB unavailable)")
+
+# 10.2 Simple search over meta-logistic C with honest GroupKFold CV
+stack_C_grid = [0.1, 1.0, 5.0]
+
+best_stack = None
+best_stack_C = None
+best_stack_cv_auc = -np.inf
+
+for C in stack_C_grid:
+    final_est = LogisticRegression(
+        max_iter=4000,
+        class_weight="balanced",
+        solver="liblinear",
+        C=C,
+        random_state=RANDOM_STATE,
+    )
+
+    stack_clf = StackingClassifier(
+        estimators=base_estimators,
+        final_estimator=final_est,
+        stack_method="predict_proba",
+        passthrough=False,
+        n_jobs=-1,
+        cv=5  # integer is fine too
+    )
+
+    # Outer evaluation also uses GroupKFold on dates
+    scores = cross_val_score(
+        stack_clf,
+        X_train,
+        y_train,
+        cv=gkf,
+        groups=groups_train,
+        scoring="roc_auc",
+        n_jobs=-1
+    )
+
+    mean_auc = scores.mean()
+    print(f"Stack C={C}: mean CV ROC-AUC={mean_auc:.3f}")
+
+    if mean_auc > best_stack_cv_auc:
+        best_stack_cv_auc = mean_auc
+        best_stack_C = C
+        best_stack = stack_clf
+
+print(f"\nBest stack meta C={best_stack_C}, CV ROC-AUC={best_stack_cv_auc:.3f}")
+
+# 10.3 Fit best stacked model on full training set (with groups for meta-CV)
+best_stack.fit(X_train, y_train)
+
+# 10.4 Evaluate stacked ensemble on held-out test set
+roc_stack, ap_stack = evaluate_model(
+    "Stacked ensemble (LR + RF + XGB)",
+    best_stack,
+    X_test,
+    y_test
+)
+
+# 10.5 Permutation importance for stacked ensemble
+perm_stack = permutation_importance(
+    best_stack,
+    X_test,
+    y_test,
+    n_repeats=30,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+
+imp_stack = (
+    pd.DataFrame({
+        "feature": X_train.columns,
+        "importance": perm_stack.importances_mean
+    })
+    .sort_values("importance", ascending=False)
+)
+
+print("\nPermutation importance (Stacked ensemble):\n",
+      imp_stack.head(12).to_string(index=False))
+
+plt.figure(figsize=(7, 4))
+sns.barplot(data=imp_stack.head(12), x="importance", y="feature", orient="h")
+plt.title("Permutation Importance — Stacked ensemble")
+plt.tight_layout()
+plt.show()
+
+# -------------------------------------------------
+# 11) Model performance comparison (base vs stacked)
+# -------------------------------------------------
+
+model_names = []
+cv_auc = []
+test_auc = []
+test_ap = []
+
+# Logistic + poly
+model_names.append("Logit+poly")
+cv_auc.append(gs_lr.best_score_)
+test_auc.append(roc_lr)
+test_ap.append(ap_lr)
+
+# Random Forest
+model_names.append("RF (tuned)")
+cv_auc.append(rf_cv.best_score_)
+test_auc.append(roc_rf)
+test_ap.append(ap_rf)
+
+# XGBoost (if available)
+if "roc_xgb" in locals():
+    model_names.append("XGB (tuned)")
+    cv_auc.append(xgb_cv.best_score_)
+    test_auc.append(roc_xgb)
+    test_ap.append(ap_xgb)
+
+# Stacked ensemble (use the honest, group-aware CV AUC we just computed)
+model_names.append("Stacked")
+cv_auc.append(best_stack_cv_auc)
+test_auc.append(roc_stack)
+test_ap.append(ap_stack)
+
+perf_df = pd.DataFrame({
+    "model": model_names,
+    "CV ROC-AUC": cv_auc,
+    "Test ROC-AUC": test_auc,
+    "Test PR-AUC": test_ap
+})
+
+print("\nModel performance summary:\n", perf_df.round(3).to_string(index=False))
+
+# Bar chart: CV vs Test ROC-AUC
+x = np.arange(len(perf_df))
+width = 0.35
+
+plt.figure(figsize=(7, 4))
+plt.bar(x - width/2, perf_df["CV ROC-AUC"], width, label="CV ROC-AUC")
+plt.bar(x + width/2, perf_df["Test ROC-AUC"], width, label="Test ROC-AUC")
+plt.xticks(x, perf_df["model"], rotation=15)
+plt.ylabel("ROC-AUC")
+plt.title("Model performance comparison (individual vs stacked ensemble)")
+plt.legend()
+plt.tight_layout()
+plt.show()
