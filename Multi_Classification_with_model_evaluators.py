@@ -931,3 +931,154 @@ plt.title("Model performance comparison (individual vs stacked ensemble)")
 plt.legend()
 plt.tight_layout()
 plt.show()
+
+# -------------------------------------------------
+# 12) Model-learned response to space-weather drivers
+#     (Stacked ensemble, 1D + 2D response curves)
+# -------------------------------------------------
+
+# 12.1 Choose which fitted model to explain
+# Prefer the stacked ensemble; fall back to XGB / RF / LogReg if needed
+if 'best_stack' in globals():
+    final_model = best_stack
+    final_model_name = "Stacked Ensemble"
+elif 'best_xgb' in globals():
+    final_model = best_xgb
+    final_model_name = "XGBoost (tuned)"
+elif 'best_rf' in globals():
+    final_model = best_rf
+    final_model_name = "RandomForest (tuned)"
+else:
+    final_model = best_lr
+    final_model_name = "LogReg + poly"
+
+print(f"\n[Model response] Explaining: {final_model_name}")
+
+# Use the same test set we evaluated on
+X_eval = X_test.copy()
+y_eval = y_test.copy()
+
+# 12.2 Helper functions: 1D and 2D "ALE-style" response curves
+def response_1d(model, X, feature, n_points=20):
+    """
+    Approximate 'ALE-style' response:
+    - Sweep feature over a grid between its 5th and 95th percentiles.
+    - For each value, overwrite that column and compute mean predicted delay prob.
+    - Center the curve so 0 = average effect.
+    """
+    x = X[feature].astype(float)
+    lo = x.quantile(0.05)
+    hi = x.quantile(0.95)
+    grid = np.linspace(lo, hi, n_points)
+
+    preds = []
+    for v in grid:
+        X_tmp = X.copy()
+        X_tmp[feature] = v
+        p = model.predict_proba(X_tmp)[:, 1]
+        preds.append(p.mean())
+    preds = np.array(preds)
+    preds_centered = preds - preds.mean()
+    return grid, preds_centered
+
+def response_2d(model, X, f1, f2, n1=20, n2=20):
+    """
+    2D response surface over (f1, f2):
+    - Grid in each variable between its 5th and 95th percentile.
+    - Mean predicted delay prob for each grid cell, centered.
+    """
+    x1 = X[f1].astype(float)
+    x2 = X[f2].astype(float)
+
+    g1 = np.linspace(x1.quantile(0.05), x1.quantile(0.95), n1)
+    g2 = np.linspace(x2.quantile(0.05), x2.quantile(0.95), n2)
+
+    Z = np.zeros((n2, n1))
+    for i, v1 in enumerate(g1):
+        for j, v2 in enumerate(g2):
+            X_tmp = X.copy()
+            X_tmp[f1] = v1
+            X_tmp[f2] = v2
+            p = model.predict_proba(X_tmp)[:, 1]
+            Z[j, i] = p.mean()
+
+    Z = Z - Z.mean()
+    return g1, g2, Z
+
+# 12.3 Physics units for axis labels
+units = {
+    'IMF_Bz': 'nT',
+    'Kp_max': 'index',
+    'Dst': 'nT',
+    'Ey': 'V·km⁻¹ (proxy −V·Bz)',
+    'storm_coupling': 'arb. (V^{4/3}·B^{2/3})',
+    'SRI': 'unitless (z-score)'
+}
+
+# Features to show in the figure (only keep those that actually exist)
+one_d_features = [
+    f for f in ['IMF_Bz', 'Kp_max', 'Dst', 'Ey', 'storm_coupling', 'SRI']
+    if f in X_eval.columns
+]
+
+# If we don’t have all of them, it still works with whatever remains
+n_1d = len(one_d_features)
+
+# 12.4 Build the figure: 1D curves + one 2D surface (IMF_Bz × Kp_max if available)
+n_rows = 2
+n_cols = 3
+plt.figure(figsize=(11, 7))
+
+# --- 1D panels ---
+for i, f in enumerate(one_d_features[:5], start=1):  # max 5 1D plots
+    plt.subplot(n_rows, n_cols, i)
+    try:
+        grid, resp = response_1d(final_model, X_eval, f, n_points=25)
+        u = f" ({units.get(f,'')})" if units.get(f) else ""
+        plt.plot(grid, resp, linewidth=1.8)
+        plt.axhline(0.0, color='k', linestyle='--', linewidth=0.8)
+        plt.xlabel(f"{f}{u}")
+        plt.ylabel("Δ predicted delay probability")
+        plt.title(f"{f}{u}")
+    except Exception as e:
+        plt.title(f"{f} (failed: {e})")
+        plt.axis("off")
+
+# --- 2D panel: joint response in storm-driver plane ---
+# Prefer IMF_Bz × Kp_max; if not available, fall back to Ey × Kp_max.
+if ('IMF_Bz' in X_eval.columns and 'Kp_max' in X_eval.columns):
+    f1, f2 = 'IMF_Bz', 'Kp_max'
+elif ('Ey' in X_eval.columns and 'Kp_max' in X_eval.columns):
+    f1, f2 = 'Ey', 'Kp_max'
+else:
+    f1, f2 = None, None
+
+if f1 is not None and f2 is not None:
+    plt.subplot(n_rows, n_cols, 6)  # bottom-right panel
+    try:
+        g1, g2, Z = response_2d(final_model, X_eval, f1, f2, n1=20, n2=20)
+        cs = plt.contourf(g1, g2, Z, levels=12)
+        plt.colorbar(cs, label="Δ predicted delay probability")
+        u1 = f" ({units.get(f1,'')})" if units.get(f1) else ""
+        u2 = f" ({units.get(f2,'')})" if units.get(f2) else ""
+        plt.xlabel(f"{f1}{u1}")
+        plt.ylabel(f"{f2}{u2}")
+        plt.title(f"Joint response: {f1} × {f2}")
+    except Exception as e:
+        plt.title(f"{f1}×{f2} (failed: {e})")
+        plt.axis("off")
+else:
+    # No suitable pair; leave last panel blank
+    plt.subplot(n_rows, n_cols, 6)
+    plt.axis("off")
+    plt.title("No 2D storm-driver pair available")
+
+plt.suptitle(
+    f"Model-learned response of delay risk to space-weather drivers\n{final_model_name}",
+    y=1.02, fontsize=12
+)
+plt.tight_layout()
+plt.savefig("fig_model_response_space_weather.png", dpi=200, bbox_inches="tight")
+plt.show()
+
+
